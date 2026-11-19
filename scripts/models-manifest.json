@@ -1,0 +1,97 @@
+{
+  "_comment": "Every file the app loads from public/models. Used by download-models.ps1 (Hugging Face), upload-models.ps1 (to the bucket) and fetch-models.mjs (from the bucket, e.g. on Render).",
+  "models": [
+    {
+      "id": "Xenova/whisper-tiny.en",
+      "mode": "Transcript only (default)",
+      "files": [
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "normalizer.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "onnx/encoder_model_fp16.onnx",
+        "onnx/decoder_model_merged_fp16.onnx"
+      ]
+    },
+    {
+      "id": "Xenova/whisper-base.en",
+      "mode": "Transcript only",
+      "files": [
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "normalizer.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "onnx/encoder_model_fp16.onnx",
+        "onnx/decoder_model_merged_fp16.onnx"
+      ]
+    },
+    {
+      "id": "Xenova/whisper-base",
+      "mode": "Transcript only",
+      "files": [
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "normalizer.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "onnx/encoder_model_fp16.onnx",
+        "onnx/decoder_model_merged_fp16.onnx"
+      ]
+    },
+    {
+      "id": "onnx-community/whisper-base_timestamped",
+      "mode": "Transcript + speakers",
+      "files": [
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "normalizer.json",
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "onnx/encoder_model.onnx",
+        "onnx/decoder_model_merged_q4.onnx",
+        "onnx/encoder_model_quantized.onnx",
+        "onnx/decoder_model_merged_quantized.onnx"
+      ]
+    },
+    {
+      "id": "onnx-community/pyannote-segmentation-3.0",
+      "mode": "Transcript + speakers",
+      "files": [
+        "config.json",
+        "preprocessor_config.json",
+        "onnx/model.onnx"
+      ]
+    },
+    {
+      "id": "Xenova/wavlm-base-plus-sv",
+      "mode": "Transcript + speakers (voiceprints)",
+      "files": [
+        "config.json",
+        "preprocessor_config.json",
+        "onnx/model_quantized.onnx"
+      ]
+    }
+  ]
+}
