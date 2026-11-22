@@ -112,17 +112,19 @@ You can also download the files by hand from each model's Hugging Face page (lin
 
 > **Cloned the repo?** Large `.onnx` files may be stored with Git LFS. Without `git lfs pull` they are tiny placeholder files and loading fails. `npm run models` treats placeholders as missing and replaces them.
 
-## Hosting the models in a private Backblaze B2 bucket (live demo on Render)
+## Hosting the models (live demo on Render)
 
-The model files don't need to live in git. The live demo's build on Render fetches them from a **private** Backblaze B2 bucket instead. The same list of files (`scripts/models-manifest.json`) is used for downloading, uploading and fetching, so the three can't drift apart.
+The model files don't live in git. The live demo's build on Render fetches them with `npm run models:fetch`, from the public Hugging Face repos by default. Render starts every build from a clean copy, so each build downloads all the models again (about 0.7 GB); Hugging Face doesn't meter those downloads. Visitors' browsers still load the models from the site itself, never from Hugging Face.
+
+A **private** Backblaze B2 bucket is optional: a backup copy the build falls back to if a Hugging Face download fails, or the only source with `MODELS_SOURCE=b2`. B2 counts every download against a free allowance of 3× the stored data per billing cycle, so using it for every build runs out after about three deploys. The same list of files (`scripts/models-manifest.json`) is used for downloading, uploading and fetching, so they can't drift apart.
 
 | Command | Runs on | What it does |
 |---|---|---|
 | `npm run models` | your PC | Hugging Face → `public/models`, only missing files |
 | `npm run models:upload` | your PC | `public/models` → bucket, only files the bucket doesn't have (same size = skip) |
-| `npm run models:fetch` | Render (or anywhere with Node 20+) | bucket → `public/models`, only missing files |
+| `npm run models:fetch` | Render (or anywhere with Node 20+) | Hugging Face (or the bucket, with `MODELS_SOURCE=b2`) → `public/models`, only missing files; failed Hugging Face downloads are retried from the bucket when the B2 settings are present |
 
-**One-time setup**
+**Optional: setting up the B2 bucket**
 
 1. In Backblaze, keep the bucket **Private** and create application keys limited to that bucket. The master key does not work with the S3 API.
    - For your PC: one key with read **and** write access.
@@ -136,9 +138,9 @@ The model files don't need to live in git. The live demo's build on Render fetch
    powershell -ExecutionPolicy Bypass -File .\scripts\upload-models.ps1 -DryRun   # shows what would be uploaded
    npm run models:upload
    ```
-5. On Render, under *Environment*, add `B2_KEY_ID`, `B2_APPLICATION_KEY` (the read-only key) and `B2_BUCKET`. Then set the build command to `npm install; npm run models:fetch && npm run build`.
+5. On Render, under *Environment*, add `B2_KEY_ID`, `B2_APPLICATION_KEY` (the read-only key) and `B2_BUCKET`, so the build can fall back to the bucket.
 
-Downloads from B2 are free up to 3× the stored amount per month, so a few deploys a month cost nothing.
+The Render build command is the same either way: `npm install; npm run models:fetch && npm run build`.
 
 ## Installation
 

@@ -1,13 +1,20 @@
-// Fetches the required model files from the PRIVATE Backblaze B2 bucket into public/models.
-// Used by the Render build (npm run models:fetch) so the models don't have to live in git.
+// Fetches the required model files into public/models. Used by the Render build (npm run models:fetch)
+// so the models don't have to live in git.
 //
 // For each file in scripts/models-manifest.json:
 //   already in public/models (not empty, not a Git LFS placeholder)  -> skip
-//   otherwise                                                         -> download from the bucket
+//   otherwise                                                         -> download
 //
-// Settings: B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET (and optional B2_PREFIX, default "models"),
+// Source (MODELS_SOURCE):
+//   huggingface (default)  the public Hugging Face repos the models come from. Free and unmetered, so a
+//                          fresh build (Render starts from a clean copy every time) costs nothing.
+//   b2                     your private Backblaze B2 bucket. B2 counts every download against a free
+//                          allowance of 3x the stored data per billing cycle; one build is ~0.8 GB.
+// With huggingface, files that fail to download are retried from B2 when the B2 settings are present.
+//
+// B2 settings: B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET (and optional B2_PREFIX, default "models"),
 // from environment variables (Render) or the project's .env file (your PC). A read-only key is enough.
-// Signs in with the B2 native API (b2_authorize_account), then downloads by file name with the token.
+// Hugging Face settings (optional): HF_ENDPOINT (default https://huggingface.co), HF_REVISION (main), HF_TOKEN.
 // Plain Node 20+, no packages needed.
 //
 //   node scripts/fetch-models.mjs            download what is missing
@@ -45,6 +52,11 @@ const keyId = setting('B2_KEY_ID');
 const appKey = setting('B2_APPLICATION_KEY');
 const bucket = setting('B2_BUCKET');
 const prefix = setting('B2_PREFIX', 'models').replace(/^\/+|\/+$/g, '');
+const source = setting('MODELS_SOURCE', 'huggingface').toLowerCase() === 'b2' ? 'b2' : 'huggingface';
+const hfEndpoint = setting('HF_ENDPOINT', 'https://huggingface.co').replace(/\/+$/, '');
+const hfRevision = setting('HF_REVISION', 'main');
+const hfToken = setting('HF_TOKEN');
+const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
 const manifest = JSON.parse(await readFile(path.join(scriptsDir, 'models-manifest.json'), 'utf8'));
 
@@ -80,17 +92,17 @@ async function authorize() {
   return { token: body.authorizationToken, downloadUrl: downloadUrl.replace(/\/+$/, '') };
 }
 
-async function download(url, token, target) {
+async function download(url, headers, target) {
   await mkdir(path.dirname(target), { recursive: true });
   const part = `${target}.part`;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(url, { headers: { Authorization: token } });
+      const res = await fetch(url, { headers });
       if (!res.ok || !res.body) {
         await res.body?.cancel().catch(() => {});   // free the connection
         if ([401, 403, 404].includes(res.status)) {
           attempt = 3;                              // retrying won't help
-          throw new Error(`HTTP ${res.status}: ${res.status === 404 ? 'not in the bucket (run npm run models:upload)' : 'key has no read access to this bucket'}`);
+          throw new Error(`HTTP ${res.status}: ${res.status === 404 ? 'file not found' : 'no read access'}`);
         }
         throw new Error(`HTTP ${res.status} ${res.statusText}`);
       }
@@ -110,7 +122,7 @@ async function download(url, token, target) {
 }
 
 // Step 1: what is already here (no network)
-console.log(`Whisper ONNX models (source: private B2 bucket "${bucket || '?'}/${prefix}")`);
+console.log(`Whisper ONNX models (source: ${source === 'b2' ? `private B2 bucket "${bucket || '?'}/${prefix}"` : hfEndpoint})`);
 const missing = [];
 for (const model of manifest.models) {
   const need = [];
@@ -135,30 +147,41 @@ if (checkOnly) {
   process.exit(1);
 }
 
-// Step 2: sign in and download only the missing files
-const unset = Object.entries({ B2_KEY_ID: keyId, B2_APPLICATION_KEY: appKey, B2_BUCKET: bucket })
+// Step 2: download only the missing files
+const b2Unset = Object.entries({ B2_KEY_ID: keyId, B2_APPLICATION_KEY: appKey, B2_BUCKET: bucket })
   .filter(([, v]) => !v || v.includes('REPLACE'))
   .map(([k]) => k);
-if (unset.length) {
-  console.error(`Set ${unset.join(', ')} (in .env on your PC, or under Environment on Render).`);
-  process.exit(1);
+
+let b2Auth = null;
+async function fromB2(id, file) {
+  if (b2Unset.length) throw new Error(`B2 not configured (set ${b2Unset.join(', ')})`);
+  b2Auth ??= await authorize();
+  const url = `${b2Auth.downloadUrl}/file/${encodeURIComponent(bucket)}/${encodePath(`${prefix}/${id}/${file}`)}`;
+  return download(url, { Authorization: b2Auth.token }, path.join(modelsDir, id, file));
 }
 
-let auth;
-try {
-  auth = await authorize();
-} catch (err) {
-  console.error(err.message);
+function fromHuggingFace(id, file) {
+  const url = `${hfEndpoint}/${id}/resolve/${encodeURIComponent(hfRevision)}/${encodePath(file)}`;
+  return download(url, hfToken ? { Authorization: `Bearer ${hfToken}` } : {}, path.join(modelsDir, id, file));
+}
+
+if (source === 'b2' && b2Unset.length) {
+  console.error(`Set ${b2Unset.join(', ')} (in .env on your PC, or under Environment on Render), or use MODELS_SOURCE=huggingface.`);
   process.exit(1);
 }
 
 let downloaded = 0;
 const failed = [];
 for (const { id, file } of missing) {
-  const name = `${prefix}/${id}/${file}`.split('/').map(encodeURIComponent).join('/');
-  const url = `${auth.downloadUrl}/file/${encodeURIComponent(bucket)}/${name}`;
   try {
-    const size = await download(url, auth.token, path.join(modelsDir, id, file));
+    let size;
+    try {
+      size = await (source === 'b2' ? fromB2(id, file) : fromHuggingFace(id, file));
+    } catch (err) {
+      if (source === 'b2' || b2Unset.length) throw err;
+      console.log(`    [b2]   ${id}/${file}: Hugging Face failed (${err.message}), trying the B2 bucket`);
+      size = await fromB2(id, file);
+    }
     downloaded += size;
     console.log(`    [get]  ${id}/${file}  (${formatSize(size)})`);
   } catch (err) {
