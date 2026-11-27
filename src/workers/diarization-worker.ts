@@ -2,10 +2,11 @@ import {
   pipeline,
   env,
   AutoProcessor,
-  AutoModelForAudioFrameClassification,
-  WavLMForXVector
+  AutoModelForAudioFrameClassification
 } from '@huggingface/transformers';
-import { clusterVoiceprints } from './speaker-clustering';
+import * as ort from 'onnxruntime-web';   // the same ONNX Runtime instance Transformers.js uses
+import { labelSpeakers, isRealSpeaker, SAMPLE_RATE } from './speaker-labelling';
+import { kaldiFbank } from './kaldi-fbank';
 import type {
   WordChunk,
   SpeakerSegment,
@@ -24,8 +25,10 @@ env.backends.onnx.wasm.proxy = false; // we are already inside a worker
 
 const ASR_MODEL = 'onnx-community/whisper-base_timestamped';
 const SEGMENTATION_MODEL = 'onnx-community/pyannote-segmentation-3.0';
-const VOICE_MODEL = 'Xenova/wavlm-base-plus-sv';   // voiceprints (speaker embeddings)
-const SAMPLE_RATE = 16000;
+// Voiceprints (speaker embeddings): WeSpeaker ResNet34, the embedding model of pyannote's own pipeline
+// (speaker-diarization-community-1), exported to ONNX. fp32: the int8 file uses ConvInteger, which the
+// WASM backend doesn't support. Its input is Kaldi-style fbank features (kaldi-fbank.ts), output 256 numbers.
+const VOICE_MODEL_FILE = 'FredrikKarlssonSpeech/pyannote-speaker-diarization-onnx/embedding/model.onnx';
 
 // dtype decides which .onnx file is loaded:
 //   fp32 → encoder_model.onnx          q4 → decoder_model_merged_q4.onnx
@@ -38,8 +41,7 @@ const ASR_CONFIG: Record<'webgpu' | 'wasm', any> = {
 let transcriber: any = null;
 let segProcessor: any = null;
 let segModel: any = null;
-let voiceProcessor: any = null;
-let voiceModel: any = null;
+let voiceSession: ort.InferenceSession | null = null;
 let activeDevice: 'webgpu' | 'wasm' = 'wasm';
 
 const post = (msg: DiarizationWorkerResponse) => self.postMessage(msg);
@@ -52,6 +54,44 @@ const onProgress = (data: any) => {
     file: data.file ?? ''
   });
 };
+
+// ── A model file from public/models, kept in the browser's Cache Storage after the first download ─
+const MODEL_CACHE = 'whisper-onnx-models';
+
+async function loadModelFile(file: string): Promise<Uint8Array> {
+  const url = new URL(`${env.localModelPath}${file}`, self.location.origin).href;
+  const cache = typeof caches !== 'undefined' ? await caches.open(MODEL_CACHE).catch(() => null) : null;
+  const cached = await cache?.match(url);
+  if (cached) return new Uint8Array(await cached.arrayBuffer());
+
+  const response = await fetch(url);
+  if (!response.ok || !response.body) throw new Error(`Could not load ${file} (${response.status})`);
+  const total = Number(response.headers.get('Content-Length')) || 0;
+  const reader = response.body.getReader();
+  const parts: Uint8Array[] = [];
+  let received = 0;
+  onProgress({ status: 'initiate', file, progress: 0 });
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    received += value.length;
+    if (total) onProgress({ status: 'progress', file, progress: (received / total) * 100 });
+  }
+  const bytes = new Uint8Array(received);
+  let at = 0;
+  for (const part of parts) { bytes.set(part, at); at += part.length; }
+  await cache?.put(url, new Response(bytes.slice(), { headers: { 'Content-Type': 'application/octet-stream' } })).catch(() => {});
+  onProgress({ status: 'done', file, progress: 100 });
+  return bytes;
+}
+
+// Voiceprint of up to 10 s of one person's clean speech
+async function embed(speech: Float32Array): Promise<Float32Array> {
+  const { data, frames } = kaldiFbank(speech);
+  const outputs = await voiceSession!.run({ fbank: new ort.Tensor('float32', data, [1, frames, 80]) });
+  return new Float32Array(outputs.embedding.data as Float32Array);
+}
 
 // ── WebGPU check: the API can exist while no usable GPU adapter is available ─
 async function detectDevice(): Promise<'webgpu' | 'wasm'> {
@@ -108,12 +148,9 @@ async function loadModels() {
     progress_callback: onProgress
   });
 
-  // Voiceprint model, quantized (model_quantized.onnx), on WASM like pyannote
-  voiceProcessor = await AutoProcessor.from_pretrained(VOICE_MODEL, { progress_callback: onProgress });
-  voiceModel = await WavLMForXVector.from_pretrained(VOICE_MODEL, {
-    device: 'wasm',
-    dtype: 'q8',
-    progress_callback: onProgress
+  // Voiceprint model (plain ONNX file, so loaded with ONNX Runtime directly), on WASM like pyannote
+  voiceSession = await ort.InferenceSession.create(await loadModelFile(VOICE_MODEL_FILE), {
+    executionProviders: ['wasm']
   });
 
   console.log('[Diarization] models ready on', activeDevice);
@@ -181,8 +218,6 @@ function toSentences(words: WordChunk[]): Sentence[] {
   return sentences;
 }
 
-const isRealSpeaker = (label: string) => label !== 'NO_SPEAKER' && !label.includes('+');
-
 // The speaker with the most talking time inside the sentence wins.
 // If nobody overlaps it (it falls in a gap), the nearest speaker turn wins.
 function speakerFor(sentence: Sentence, segments: SpeakerSegment[]): string {
@@ -230,103 +265,6 @@ function toLines(sentences: Sentence[], segments: SpeakerSegment[]): SpeakerLine
 function mergeWordsWithSpeakers(words: WordChunk[], segments: SpeakerSegment[]): SpeakerLine[] {
   const sorted = [...words].sort((a, b) => a.timestamp[0] - b.timestamp[0]);
   return toLines(toSentences(collapseRepeats(sorted)), segments);
-}
-
-// ── Who speaks when: pyannote turns + WavLM voiceprints + grouping ───────────
-// 1. pyannote finds speech turns in 60 s chunks (overlapping by 10 s). Running it on a whole long
-//    recording at once needs gigabytes of memory, and it only tells apart 3 voices per chunk,
-//    numbered from scratch in every chunk.
-// 2. For each voice in each chunk, WavLM turns up to 10 s of that voice into a voiceprint
-//    (512 numbers; the same person gives similar numbers).
-// 3. All voiceprints of the whole recording are grouped (speaker-clustering.ts): similar ones are one
-//    speaker. So any number of speakers works, and someone who comes back later keeps their label.
-const SEG_CHUNK_SEC = 60;
-const SEG_OVERLAP_SEC = 10;
-const VOICE_MAX_SEC = 10;        // audio per voiceprint
-const VOICE_MIN_SEC = 0.5;       // less speech than this in a chunk: too short for a reliable voiceprint
-const SAME_SPEAKER_SIMILARITY = 0.8;   // grouping threshold when the number of speakers is not given
-
-interface ChunkVoice {
-  chunk: number;
-  segments: SpeakerSegment[];    // this voice's turns, already cut to the part of the chunk it owns
-  voiceprint: Float32Array;
-}
-
-// Up to VOICE_MAX_SEC of one voice's audio, longest turns first
-function voiceSamples(audio: Float32Array, turns: SpeakerSegment[]): Float32Array {
-  const pieces: Float32Array[] = [];
-  let total = 0;
-  const max = VOICE_MAX_SEC * SAMPLE_RATE;
-  for (const t of [...turns].sort((a, b) => (b.end - b.start) - (a.end - a.start))) {
-    if (total >= max) break;
-    const from = Math.floor(t.start * SAMPLE_RATE);
-    const to = Math.min(Math.floor(t.end * SAMPLE_RATE), from + (max - total));
-    if (to > from) { pieces.push(audio.subarray(from, to)); total += to - from; }
-  }
-  const out = new Float32Array(total);
-  let at = 0;
-  for (const p of pieces) { out.set(p, at); at += p.length; }
-  return out;
-}
-
-async function labelSpeakers(audio: Float32Array, numSpeakers?: number): Promise<SpeakerSegment[]> {
-  const totalSec = audio.length / SAMPLE_RATE;
-  const chunkSize = SEG_CHUNK_SEC * SAMPLE_RATE;
-  const step = (SEG_CHUNK_SEC - SEG_OVERLAP_SEC) * SAMPLE_RATE;
-  const voices: ChunkVoice[] = [];
-  post({ type: 'progress', stage: 'labelling', done: 0, total: totalSec });
-
-  for (let position = 0, chunk = 0; position < audio.length; position += step, chunk++) {
-    const piece = audio.slice(position, position + chunkSize);
-    const start = position / SAMPLE_RATE;
-    const end = start + piece.length / SAMPLE_RATE;
-    const isFirst = position === 0;
-    const isLast = position + chunkSize >= audio.length;
-
-    // 1. Speech turns in this chunk (local labels SPEAKER_1..3; overlapped speech is skipped)
-    const inputs = await segProcessor(piece);
-    const { logits } = await segModel(inputs);
-    const raw = segProcessor.post_process_speaker_diarization(logits, piece.length)[0];
-    const turns: SpeakerSegment[] = raw
-      .map((t: any) => ({
-        id: t.id,
-        label: segModel.config.id2label[t.id] as string,
-        start: t.start + start,
-        end: Math.min(t.end + start, end),
-        confidence: t.confidence
-      }))
-      .filter((t: SpeakerSegment) => isRealSpeaker(t.label) && t.end > t.start);
-
-    // The part of the chunk it "owns", so the 10 s overlap isn't counted twice
-    const ownFrom = isFirst ? 0 : start + SEG_OVERLAP_SEC / 2;
-    const ownTo = isLast ? Infinity : end - SEG_OVERLAP_SEC / 2;
-
-    // 2. One voiceprint per local voice
-    for (const label of new Set(turns.map(t => t.label))) {
-      const own = turns.filter(t => t.label === label);
-      const speech = own.reduce((sum, t) => sum + (t.end - t.start), 0);
-      if (speech < VOICE_MIN_SEC) continue;
-      const voiceInputs = await voiceProcessor(voiceSamples(audio, own));
-      const { embeddings } = await voiceModel(voiceInputs);
-      const segments = own
-        .map(t => ({ ...t, start: Math.max(t.start, ownFrom), end: Math.min(t.end, ownTo) }))
-        .filter(t => t.end > t.start);
-      voices.push({ chunk, segments, voiceprint: new Float32Array(embeddings.data) });
-    }
-
-    post({ type: 'progress', stage: 'labelling', done: Math.min(end, totalSec), total: totalSec });
-    if (isLast) break;
-  }
-
-  // 3. Group the voiceprints of the whole recording into speakers
-  const speakerOf = clusterVoiceprints(
-    voices.map(v => v.voiceprint),
-    voices.map(v => v.chunk),
-    { threshold: SAME_SPEAKER_SIMILARITY, numSpeakers }
-  );
-  return voices
-    .flatMap((v, i) => v.segments.map(t => ({ ...t, id: speakerOf[i], label: `SPEAKER_${speakerOf[i] + 1}` })))
-    .sort((a, b) => a.start - b.start);
 }
 
 // ── Transcribe (streams words) → pyannote → merge ────────────────────────────
@@ -412,7 +350,18 @@ async function transcribe(audioBuffer: ArrayBuffer, numSpeakers?: number) {
     post({ type: 'progress', stage: 'transcribing', done: Math.min(offset + windowSec, totalSec), total: totalSec });
   }
 
-  const segments = await labelSpeakers(audio, numSpeakers);
+  const segments = await labelSpeakers(
+    audio,
+    {
+      segProcessor,
+      segModel,
+      embed
+    },
+    {
+      numSpeakers,
+      onProgress: (done, total) => post({ type: 'progress', stage: 'labelling', done, total })
+    }
+  );
   post({ type: 'segments', segments });
 
   const lines = mergeWordsWithSpeakers(words, segments);
@@ -420,8 +369,12 @@ async function transcribe(audioBuffer: ArrayBuffer, numSpeakers?: number) {
 }
 
 // ── Messages from the app ────────────────────────────────────────────────────
-self.addEventListener('message', async (event: MessageEvent<DiarizationWorkerMessage>) => {
-  const msg = event.data;
+// Requests run one after another. ONNX Runtime allows one model run at a time, and the voiceprint
+// model is called directly, outside Transformers.js' own queue: two transcriptions side by side
+// would overlap their runs and fail with "Session mismatch".
+let queue: Promise<void> = Promise.resolve();
+
+async function handle(msg: DiarizationWorkerMessage) {
   try {
     if (msg.type === 'load') {
       await load();
@@ -432,4 +385,8 @@ self.addEventListener('message', async (event: MessageEvent<DiarizationWorkerMes
   } catch (error) {
     post({ type: 'error', error: error instanceof Error ? error.message : String(error) });
   }
+}
+
+self.addEventListener('message', (event: MessageEvent<DiarizationWorkerMessage>) => {
+  queue = queue.then(() => handle(event.data));
 });

@@ -149,3 +149,6 @@ public/models/*
 !public/models/README.md
 !public/models/NOTICE.md
 !public/models/LICENSE
+
+# Speaker-accuracy benchmark data and results: downloaded by "npm run eval:data", never committed.
+eval/

@@ -99,6 +99,8 @@ export const useDiarizationWorker = () => {
 
   // numSpeakers: exact number of speakers if the user knows it; leave out for automatic
   const transcribe = useCallback((audio: ArrayBuffer, numSpeakers?: number) => {
+    // One run at a time: a second run would replace the first one's resolve/reject
+    if (resolveRef.current) return Promise.reject(new Error('A transcription is already running'));
     setError(null);
     setWords([]);
     setSegments([]);

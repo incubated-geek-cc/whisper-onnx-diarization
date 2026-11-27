@@ -20,15 +20,12 @@
 <img src='https://raw.githubusercontent.com/incubated-geek-cc/whisper-onnx-diarization/main/transcription_process.gif' width="600px" />
 
 #### Demo (3) Video upload & audio extraction
-<!-- TODO: record and upload video_extraction.gif -->
 <img src='https://raw.githubusercontent.com/incubated-geek-cc/whisper-onnx-diarization/main/video_extraction.gif' width="600px" />
 
 #### Demo (4) Transcript + speakers
-<!-- TODO: record and upload diarization_process.gif -->
 <img src='https://raw.githubusercontent.com/incubated-geek-cc/whisper-onnx-diarization/main/diarization_process.gif' width="600px" />
 
 #### Demo (5) Renaming speakers
-<!-- TODO: record and upload rename_speakers.gif -->
 <img src='https://raw.githubusercontent.com/incubated-geek-cc/whisper-onnx-diarization/main/rename_speakers.gif' width="600px" />
 
 ### 🌟 Try it yourself
@@ -50,7 +47,7 @@
 - 🎬 Upload video clips (.mp4 .mov .webm .mkv .avi files); the video plays alongside the transcript where the browser supports the format
 - 💬 Audio extraction & conversion to 16 kHz WAV via FFMPEG
 - 🤖 AI-powered Speech Recognition using Whisper OpenAI local models
-- 🗣️ Optional speaker labels ("Transcript + speakers") for any number of speakers, using pyannote + WavLM voiceprints; optionally tell it how many people there are
+- 🗣️ Optional speaker labels ("Transcript + speakers") for any number of speakers, using pyannote + WeSpeaker ResNet34 voiceprints; optionally tell it how many people there are
 - ✏️ Rename speakers (e.g. `Speaker 1` → `George`) and every line updates
 - 📊 Progress bar through the recording; in speaker mode it shows which step is running
 - 💾 Export transcription results (TXT / JSON), including partial results while transcribing
@@ -78,7 +75,7 @@ The app runs fully offline, so the models are served from `public/models/`. Only
 | `Xenova/whisper-base` | Transcript only (multilingual) | same as above |
 | `onnx-community/whisper-base_timestamped` | Transcript + speakers (words with timestamps) | `encoder_model.onnx`, `decoder_model_merged_q4.onnx` (WebGPU); `encoder_model_quantized.onnx`, `decoder_model_merged_quantized.onnx` (WASM fallback) |
 | `onnx-community/pyannote-segmentation-3.0` | Transcript + speakers (who speaks when) | `model.onnx` |
-| `Xenova/wavlm-base-plus-sv` | Transcript + speakers (voiceprints: matching voices) | `model_quantized.onnx` |
+| `FredrikKarlssonSpeech/pyannote-speaker-diarization-onnx` | Transcript + speakers (voiceprints: matching voices) | `embedding/model.onnx` (WeSpeaker ResNet34, fp32) |
 
 See [`public/models/README.md`](public/models/README.md) for the full folder layout.
 
@@ -159,7 +156,7 @@ Download the models **before** building: `npm run build` copies `public/models` 
 - **Transcript only** (default): the Whisper model picked in the settings (gear icon) transcribes in 30-second windows and streams timestamped lines.
 - **Transcript + speakers**: a separate worker with its own two models.
   1. **Step 1, transcribing audio:** `whisper-base_timestamped` transcribes in 30-second windows (5 s overlap) with a timestamp for every word. Text streams live.
-  2. **Step 2, identifying speakers:** `pyannote-segmentation-3.0` finds speech turns in 60-second chunks (10 s overlap). For each voice in each chunk, `wavlm-base-plus-sv` makes a *voiceprint* from up to 10 s of that voice. All voiceprints of the recording are then grouped (average-linkage clustering on cosine similarity, `src/workers/speaker-clustering.ts`): similar voiceprints are one speaker. Voices that pyannote told apart within one chunk are never merged. If you pick the number of speakers, grouping stops at exactly that number; otherwise it stops when the closest remaining voices are less than 0.8 similar.
+  2. **Step 2, identifying speakers** (`src/workers/speaker-labelling.ts`): `pyannote-segmentation-3.0` hears 10 seconds at a time (the length it was trained on; it tells apart at most 3 voices per window, 2 at once), with windows starting every 5 s. A voice that talks during the shared 5 s of two windows is chained into one *track*: one person's continuous stretch. For each track, WeSpeaker ResNet34 makes a *voiceprint* from up to 10 s of that person speaking alone. Tracks are then grouped (average-linkage clustering on cosine similarity, `src/workers/speaker-clustering.ts`); tracks heard in the same window are never merged. If you pick the number of speakers, grouping stops at exactly that number; otherwise it stops when the closest remaining tracks are less than 0.4 similar. Overlapping speech is labelled with both speakers. `npm run eval` measures accuracy (see [Measuring accuracy](#measuring-accuracy)).
   3. **Merge:** repeated words are collapsed (Whisper sometimes loops on sounds like `[screaming]`), words are grouped into sentences, each sentence goes to the speaker who talks most during it, and consecutive sentences by the same speaker are joined into one line.
 
 Limits of speaker mode: at most 3 people talking within the same minute can be told apart (any number overall); a voice with less than half a second of speech in a minute isn't labelled; people talking over each other are skipped; English only. The 0.8 threshold is a starting point: if one person is split into two labels, or two people merged, pick the number of speakers.
@@ -215,6 +212,42 @@ await ffmpeg.exec(['-y', '-i', inputName, '-vn', '-ar', '16000', '-ac', '1', '-c
 
 The live demo on Render counts page views with [GoatCounter](https://www.goatcounter.com/) (no cookies). The tracker is added only when Render builds the site (Render sets `RENDER=true` during builds; see `vite.config.ts`). Local builds, clones and release downloads contain no tracker.
 
+## Design decisions
+
+![How the app labels who said what](docs/images/pipeline.png)
+
+**1. pyannote hears 10 seconds at a time.** That is the length it was trained on. It tells apart at most 3 voices per window, so a fourth gets lumped in with someone else. How often that matters depends on the recording:
+
+![How often more than 3 voices share one 10-second window](docs/images/edge-case.png)
+
+**2. Overlapping windows link the same person.** pyannote restarts its numbering in every window. A voice talking during the 5 seconds two windows share is the same voice, so each person becomes one track:
+
+![Windows and chaining](docs/images/windows-chaining.png)
+
+**3. ResNet34 for voiceprints, not WavLM.** Same pipeline, only the voiceprint model swapped, speaker count given so no threshold is involved:
+
+![ResNet34 makes fewer speaker errors than WavLM](docs/images/voiceprint-comparison.png)
+
+**4. The cost: an fbank front end.** WavLM reads raw audio; ResNet34 reads fbank features, which its ONNX file doesn't include. `src/workers/kaldi-fbank.ts` computes them and matches the reference Kaldi implementation to within 0.00004:
+
+![How fbank features are made](docs/images/fbank.png)
+
+**5. Models come from Hugging Face at build time.** Builds start from a clean copy each time, so they re-download every model (about 0.7 GB); Hugging Face doesn't meter that, B2 does. Visitors load models from the site itself:
+
+![Where the models come from](docs/images/models-privacy.png)
+
+## Measuring accuracy
+
+`npm run eval` runs the exact speaker code the app runs (`src/workers/speaker-labelling.ts`) on recordings with human speaker labels, and reports the diarization error rate (DER): the share of speech time with the wrong speaker, a missed speaker or a false alarm. Lower is better.
+
+```powershell
+npm run eval:data                    # downloads 4 AMI test meetings (about 100 minutes); -All for all 16
+npm run eval                         # ResNet34, Auto and known speaker count
+npm run eval -- --voice wavlm        # WavLM, for comparison (needs Xenova/wavlm-base-plus-sv)
+```
+
+The scoring matches pyannote's official tool (`pyannote.metrics`) to within 0.1%. Results above are from AMI meeting excerpts arranged into a 1-hour recording; the full AMI meetings from `npm run eval:data` are the stronger test. WavLM ran in 8-bit precision and ResNet34 in full precision.
+
 ## Common Issues & Fixes
 
 **Models not reading correctly / fetched from huggingface.co.** The folder structure must match the model ID exactly, and a single missing JSON file gives the same error. Run the download script with `-CheckOnly` to see what is missing.
@@ -233,7 +266,7 @@ This project is released under the [MIT License](LICENSE). It builds on the foll
 |---|---|---|
 | Whisper speech recognition models | [OpenAI](https://github.com/openai/whisper), *Robust Speech Recognition via Large-Scale Weak Supervision* ([arXiv:2212.04356](https://arxiv.org/abs/2212.04356)) | Apache-2.0 (per the [Hugging Face model card](https://huggingface.co/openai/whisper-tiny.en)) |
 | Whisper ONNX weights | [Xenova](https://huggingface.co/Xenova) (Joshua Lochner): [whisper-tiny.en](https://huggingface.co/Xenova/whisper-tiny.en), [whisper-base.en](https://huggingface.co/Xenova/whisper-base.en), [whisper-base](https://huggingface.co/Xenova/whisper-base); [onnx-community/whisper-base_timestamped](https://huggingface.co/onnx-community/whisper-base_timestamped) | Apache-2.0 |
-| Speaker voiceprint model | [microsoft/wavlm-base-plus-sv](https://huggingface.co/microsoft/wavlm-base-plus-sv); ONNX conversion [Xenova/wavlm-base-plus-sv](https://huggingface.co/Xenova/wavlm-base-plus-sv) | CC BY-SA 3.0 |
+| Speaker voiceprint model | WeSpeaker ResNet34 from [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) ([WeSpeaker](https://github.com/wenet-e2e/wespeaker), [arXiv:2210.17016](https://arxiv.org/abs/2210.17016)); ONNX export [FredrikKarlssonSpeech/pyannote-speaker-diarization-onnx](https://huggingface.co/FredrikKarlssonSpeech/pyannote-speaker-diarization-onnx) | CC BY 4.0 |
 | Speaker segmentation model | [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) by the [pyannote](https://github.com/pyannote/pyannote-audio) team; ONNX conversion [onnx-community/pyannote-segmentation-3.0](https://huggingface.co/onnx-community/pyannote-segmentation-3.0) | MIT |
 | Starting point for the app | [xenova/whisper-web](https://github.com/xenova/whisper-web/tree/experimental-webgpu) (`experimental-webgpu` branch) | MIT |
 | Starting point for speaker mode | [Xenova/whisper-speaker-diarization](https://huggingface.co/spaces/Xenova/whisper-speaker-diarization) (Hugging Face Space) | not stated |

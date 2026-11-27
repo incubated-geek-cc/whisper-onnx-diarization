@@ -85,12 +85,10 @@
       ]
     },
     {
-      "id": "Xenova/wavlm-base-plus-sv",
+      "id": "FredrikKarlssonSpeech/pyannote-speaker-diarization-onnx",
       "mode": "Transcript + speakers (voiceprints)",
       "files": [
-        "config.json",
-        "preprocessor_config.json",
-        "onnx/model_quantized.onnx"
+        "embedding/model.onnx"
       ]
     }
   ]

@@ -14,7 +14,9 @@
     "preview": "serve -s dist",
     "models": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download-models.ps1 || pwsh -NoProfile -File scripts/download-models.ps1",
     "models:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/upload-models.ps1 || pwsh -NoProfile -File scripts/upload-models.ps1",
-    "models:fetch": "node scripts/fetch-models.mjs"
+    "models:fetch": "node scripts/fetch-models.mjs",
+    "eval:data": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/download-eval-data.ps1 || pwsh -NoProfile -File scripts/download-eval-data.ps1",
+    "eval": "tsx scripts/eval-diarization.ts"
   },
   "description": "Runs Whisper OpenAI and pyannote locally to transcribe audio and video recordings offline, with speaker diarization.",
   "keywords": [
@@ -116,6 +118,7 @@
     "rollup-plugin-polyfill-node": "^0.13.0",
     "stream-browserify": "^3.0.0",
     "tailwindcss": "^3.4.11",
+    "tsx": "^4.19.2",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.0.1",
     "vite": "^7.0.0",

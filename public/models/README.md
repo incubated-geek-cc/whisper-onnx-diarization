@@ -25,11 +25,10 @@ models/
         ├── config.json, preprocessor_config.json
         └── onnx/
             └── model.onnx
-Xenova/
-└── wavlm-base-plus-sv/                Transcript + speakers: voiceprints (matches voices)
-    ├── config.json, preprocessor_config.json
-    └── onnx/
-        └── model_quantized.onnx
+FredrikKarlssonSpeech/
+└── pyannote-speaker-diarization-onnx/ Transcript + speakers: voiceprints (WeSpeaker ResNet34)
+    └── embedding/
+        └── model.onnx                 (fp32; input = fbank features from src/workers/kaldi-fbank.ts)
 ```
 
 Only these `.onnx` files are loaded. The other variants Hugging Face publishes (`_fp16`, `_int8`, `_bnb4`, `decoder_with_past_model`, ...) are not needed.

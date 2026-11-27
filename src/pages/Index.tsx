@@ -215,8 +215,16 @@ export const Index = () => {
     setTranscriptionResult(null);
   };
 
+  const [isPreparing, setIsPreparing] = useState(false);
+  const preparingRef = useRef(false);
+
   const handleTranscribe = async () => {
     if (identifySpeakers ? !diarization.isReady : !isReady) return;
+    // Reading a long recording takes seconds before the worker starts:
+    // lock the button now so a second click can't start a second run alongside.
+    if (preparingRef.current) return;
+    preparingRef.current = true;
+    setIsPreparing(true);
     try {
       let arrayBuffer: ArrayBuffer;
       if (audioBlob) {
@@ -255,9 +263,12 @@ export const Index = () => {
       console.error('Transcription failed:', error);
       toast({
         title: 'Processing failed',
-        description: 'Failed to process audio file',
+        description: error instanceof Error ? error.message : 'Failed to process audio file',
         variant: 'destructive'
       });
+    } finally {
+      preparingRef.current = false;
+      setIsPreparing(false);
     }
   };
 
@@ -277,7 +288,7 @@ export const Index = () => {
       : 'Model not loaded';
 
   const hasAudio = audioSrc || audioBlob;
-  const canTranscribe = hasAudio && (identifySpeakers
+  const canTranscribe = hasAudio && !isPreparing && (identifySpeakers
     ? diarization.isReady && !diarization.isTranscribing
     : isReady && !isTranscribing);
   return (
@@ -538,7 +549,7 @@ export const Index = () => {
                       />
                       {identifySpeakers && (
                         <p className="text-xs text-muted-foreground">
-                          "Transcript + speakers" uses its own models (Whisper Base timestamped + pyannote),
+                          "Transcript + speakers" uses its own models (Whisper Base timestamped + pyannote + a voiceprint model),
                           so this choice only applies to "Transcript only".
                         </p>
                       )}

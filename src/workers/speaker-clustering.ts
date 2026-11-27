@@ -6,7 +6,7 @@
 //   - the most similar pair is below `threshold`        (number of speakers unknown), or
 //   - only `numSpeakers` groups are left                 (number of speakers given by the user).
 //
-// Voiceprints from the same chunk with different local labels are different people by definition
+// Voiceprints of voices that pyannote heard in the same window are different people by definition
 // (pyannote already told them apart), so they are not merged ("cannot-link").
 // Exception: if the user gave numSpeakers and only such pairs are left, the user's number wins
 // and the most similar pair is merged anyway (pyannote sometimes splits one voice in two).
@@ -27,13 +27,14 @@ function normalise(v: Float32Array): Float32Array {
 
 /**
  * @param embeddings one voiceprint per item
- * @param groups     chunk number of each item (items in the same chunk are never merged)
+ * @param apart      pairs of items that must never be merged (heard in the same window)
  * @returns          speaker number per item, numbered 0, 1, 2… in order of first appearance
  */
-export function clusterVoiceprints(embeddings: Float32Array[], groups: number[], options: ClusterOptions): number[] {
+export function clusterVoiceprints(embeddings: Float32Array[], apart: [number, number][], options: ClusterOptions): number[] {
   const n = embeddings.length;
   if (n === 0) return [];
   const vectors = embeddings.map(normalise);
+  const mustSplit = new Set(apart.map(([i, j]) => (i < j ? i * n + j : j * n + i)));
 
   // Pairwise similarity. `sim` has -Infinity for must-stay-apart pairs; `raw` ignores that rule.
   const sim: Float64Array[] = Array.from({ length: n }, () => new Float64Array(n));
@@ -44,7 +45,7 @@ export function clusterVoiceprints(embeddings: Float32Array[], groups: number[],
       const a = vectors[i], b = vectors[j];
       for (let d = 0; d < a.length; d++) s += a[d] * b[d];
       raw[i][j] = raw[j][i] = s;
-      sim[i][j] = sim[j][i] = groups[i] === groups[j] ? -Infinity : s;
+      sim[i][j] = sim[j][i] = mustSplit.has(i * n + j) ? -Infinity : s;
     }
   }
 
